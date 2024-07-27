@@ -58,7 +58,7 @@ if __name__ == "__main__":
     images = results['images']
 
     # Save images
-    save_dir = Path('results')
+    save_dir = Path('results/dog_lora')
     save_dir.mkdir(exist_ok=True)
     # Find the first available index
     all_files = list(save_dir.glob('*.png'))

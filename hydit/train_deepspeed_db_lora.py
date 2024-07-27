@@ -20,7 +20,7 @@ from IndexKits.index_kits import ResolutionGroup
 from IndexKits.index_kits.sampler import DistributedSamplerWithStartIndex, BlockDistributedSampler
 from hydit.config import get_args
 from hydit.constants import VAE_EMA_PATH, TEXT_ENCODER, TOKENIZER, T5_ENCODER
-from hydit.data_loader.arrow_load_stream import TextImageArrowStream
+from hydit.data_loader.arrow_load_stream import TextImageArrowStream, TextImageArrowStreamDBLoRA
 from hydit.diffusion import create_diffusion
 from hydit.ds_config import deepspeed_config_from_args
 from hydit.lr_scheduler import WarmupLR
@@ -30,7 +30,7 @@ from hydit.modules.models import HUNYUAN_DIT_MODELS, HunYuanDiT
 from hydit.modules.text_encoder import MT5Embedder
 from hydit.modules.posemb_layers import init_image_posemb
 from hydit.utils.tools import create_exp_folder, model_resume, get_trainable_params
-
+import pdb
 
 def deepspeed_initialize(args, logger, model, opt, deepspeed_config):
     logger.info(f"Initialize deepspeed...")
@@ -115,7 +115,17 @@ def save_checkpoint(args, rank, logger, model, ema, epoch, train_steps, checkpoi
 
 @torch.no_grad()
 def prepare_model_inputs(args, batch, device, vae, text_encoder, text_encoder_t5, freqs_cis_img):
-    image, text_embedding, text_embedding_mask, text_embedding_t5, text_embedding_mask_t5, kwargs = batch
+    # image, text_embedding, text_embedding_mask, text_embedding_t5, text_embedding_mask_t5, kwargs = batch
+    image, class_image, text_embedding, class_text_embedding, text_embedding_mask, class_text_embedding_mask, text_embedding_t5, class_text_embedding_t5, text_embedding_mask_t5, class_text_embedding_mask_t5, kwargs = batch
+
+    # ==============================================================
+    # ==================== with prior loss =========================
+    # ==============================================================
+    image = torch.cat((image, class_image), dim=0)
+    text_embedding = torch.cat((text_embedding, class_text_embedding), dim=0)
+    text_embedding_mask = torch.cat((text_embedding_mask, class_text_embedding_mask), dim=0)
+    text_embedding_t5 = torch.cat((text_embedding_t5, class_text_embedding_t5), dim=0)
+    text_embedding_mask_t5 = torch.cat((text_embedding_mask_t5, class_text_embedding_mask_t5), dim=0)
 
     # clip & mT5 text embedding
     text_embedding = text_embedding.to(device)
@@ -322,7 +332,7 @@ def main(args):
     logger.info(f"Building Streaming Dataset.")
     logger.info(f"    Loading index file {args.index_file} (v2)")
 
-    dataset = TextImageArrowStream(args=args,
+    dataset = TextImageArrowStreamDBLoRA(args=args,
                                    resolution=image_size[0],
                                    random_flip=args.random_flip,
                                    log_fn=logger.info,
@@ -338,6 +348,7 @@ def main(args):
                                    uncond_p_t5=args.uncond_p_t5,
                                    text_ctx_len_t5=args.text_len_t5,
                                    tokenizer_t5=tokenizer_t5,
+                                   class_index_file=args.class_index_file
                                    )
     if args.multireso:
         sampler = BlockDistributedSampler(dataset, num_replicas=world_size, rank=rank, seed=args.global_seed,
@@ -457,9 +468,11 @@ def main(args):
         logger.info(f"    Beginning epoch {epoch}...")
         for batch in loader:
             latents, model_kwargs = prepare_model_inputs(args, batch, device, vae, text_encoder, text_encoder_t5, freqs_cis_img)
-
-            loss_dict = diffusion.training_losses(model=model, x_start=latents, model_kwargs=model_kwargs)
+            # import pdb
+            # pdb.set_trace()
+            loss_dict = diffusion.training_losses(model=model, x_start=latents, model_kwargs=model_kwargs, prior_loss=True)
             loss = loss_dict["loss"].mean()
+            loss += loss_dict["loss_prior"].mean()
             model.backward(loss)
             last_batch_iteration = (train_steps + 1) // (global_batch_size // (batch_size * world_size))
             model.step(lr_kwargs={'last_batch_iteration': last_batch_iteration})

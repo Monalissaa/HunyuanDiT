@@ -487,7 +487,7 @@ class GaussianDiffusion:
         output = th.where((t == 0), decoder_nll, kl)
         return {"output": output, "pred_xstart": out["pred_xstart"], "extra": out["extra"]}
 
-    def training_losses(self, model, x_start, model_kwargs=None, controlnet=None, noise=None):
+    def training_losses(self, model, x_start, model_kwargs=None, controlnet=None, noise=None, prior_loss=False):
         """
         Compute training losses for a single timestep.
 
@@ -546,7 +546,7 @@ class GaussianDiffusion:
                 model_kwargs.pop('condition')
                 model_kwargs.update(controls)
             out_dict = model(x_t, t, **model_kwargs)
-            model_output = out_dict['x']
+            model_output = out_dict['x']   # x_t: [1, 4, 128, 128], model_output: [1, 8, 128, 128]
             extra = {k: v for k, v in out_dict.items() if k != 'x'}
 
             if self.model_var_type in [
@@ -555,24 +555,52 @@ class GaussianDiffusion:
             ]:
                 B, C = x_t.shape[:2]
                 assert_shape(model_output, (B, C * 2, *x_t.shape[2:]))
-                model_output, model_var_values = th.split(model_output, C, dim=1)
+                model_output, model_var_values = th.split(model_output, C, dim=1)  # model_output: [1, 8, 128, 128] -> [1, 4, 128, 128]
                 # Learn the variance using the variational bound, but don't let
                 # it affect our mean prediction.
                 frozen_out = th.cat([model_output.detach(), model_var_values], dim=1)
-                terms["vb"] = self._vb_terms_bpd(
-                    model=lambda *args, r=frozen_out: dict(x=r),
-                    x_start=x_start,
-                    x_t=x_t,
-                    t=t,
-                    clip_denoised=False,
-                )["output"]
+                if prior_loss:
+                    frozen_out, frozen_out_prior = th.chunk(frozen_out, 2, dim=0)
+                    x_start, x_start_prior = th.chunk(x_start, 2, dim=0)
+                    x_t, x_t_prior = th.chunk(x_t, 2, dim=0)
+                    t, t_prior = th.chunk(t, 2, dim=0)
+                    noise, noise_prior = th.chunk(noise, 2, dim=0)
+                    model_output, model_output_prior = th.chunk(model_output, 2, dim=0)
+                    terms["vb"] = self._vb_terms_bpd(
+                        model=lambda *args, r=frozen_out: dict(x=r),
+                        x_start=x_start,
+                        x_t=x_t,
+                        t=t,
+                        clip_denoised=False,
+                    )["output"]
+
+                    terms["vb_prior"] = self._vb_terms_bpd(
+                        model=lambda *args, r=frozen_out_prior: dict(x=r),
+                        x_start=x_start_prior,
+                        x_t=x_t_prior,
+                        t=t_prior,
+                        clip_denoised=False,
+                    )["output"]
+
+                else:
+                    terms["vb"] = self._vb_terms_bpd(
+                        model=lambda *args, r=frozen_out: dict(x=r),
+                        x_start=x_start,
+                        x_t=x_t,
+                        t=t,
+                        clip_denoised=False,
+                    )["output"]
                 if self.loss_type == LossType.RESCALED_MSE:
                     # Divide by 1000 for equivalence with initial implementation.
                     # Without a factor of 1/1000, the VB term hurts the MSE term.
                     terms["vb"] *= self.num_timesteps / 1000.0
-
+                    if prior_loss:
+                        terms["vb_prior"] *= self.num_timesteps / 1000.0
+            
             if self.model_mean_type == ModelMeanType.VELOCITY:
                 target = self._velocity_from_xstart_and_noise(x_start, t, noise)
+                if prior_loss:
+                        target_prior = self._velocity_from_xstart_and_noise(x_start_prior, t_prior, noise_prior)
             else:
                 target = {
                     # ModelMeanType.PREVIOUS_X: self.q_posterior_mean_variance(
@@ -581,6 +609,15 @@ class GaussianDiffusion:
                     ModelMeanType.START_X: x_start,
                     ModelMeanType.EPSILON: noise,
                 }[self.model_mean_type]
+                if prior_loss:
+
+                    target_prior = {
+                        # ModelMeanType.PREVIOUS_X: self.q_posterior_mean_variance(
+                        #     x_start=x_start, x_t=x_t, t=t
+                        # )[0],
+                        ModelMeanType.START_X: x_start_prior,
+                        ModelMeanType.EPSILON: noise_prior,
+                    }[self.model_mean_type]
             assert_shape(model_output, target, x_start)
             raw_mse = mean_flat((target - model_output) ** 2).detach()
             terms["mse"] = mse_loss_weight * mean_flat((target - model_output) ** 2)
@@ -590,6 +627,17 @@ class GaussianDiffusion:
             else:
                 terms["loss"] = terms["mse"]
                 terms["raw_loss"] = raw_mse
+            
+            if prior_loss:
+                raw_mse_prior = mean_flat((target_prior - model_output_prior) ** 2).detach()
+                terms["mse_prior"] = mse_loss_weight * mean_flat((target_prior - model_output_prior) ** 2)
+                if "vb" in terms:
+                    terms["loss_prior"] = terms["mse_prior"] + terms["vb_prior"]
+                    terms["raw_loss_prior"] = raw_mse_prior + terms["vb_prior"].detach()
+                else:
+                    terms["loss_prior"] = terms["mse_prior"]
+                    terms["raw_loss_prior"] = raw_mse_prior
+
         else:
             raise NotImplementedError(self.loss_type)
 

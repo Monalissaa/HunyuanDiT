@@ -172,6 +172,7 @@ def get_args(default_args=None):
 
     # Dataset
     parser.add_argument("--index-file", type=str, nargs='+', help="During training, provide a JSON file with data indices.")
+    parser.add_argument("--class-index-file", type=str, nargs='+', default=None, help="During training, provide a JSON file with prior data indices.")
     parser.add_argument("--random-flip", action="store_true", help="Random flip image")
     parser.add_argument("--reset-loader", action="store_true",
                         help="Reset the data loader. It is useful when resuming from a checkpoint but switch to a new "
